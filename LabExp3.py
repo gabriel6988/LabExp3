@@ -149,15 +149,13 @@ class GitHubPRCollector:
                 "title": getattr(pr, 'title', '')[:200],
                 "title_length": len(getattr(pr, 'title', '')),
                 "description_length": len(pr.body) if pr.body else 0,
-                "description_markdown_chars": len(pr.body) if pr.body else 0,
                 "description_code_blocks": pr.body.count('```')//2 if pr.body else 0,
                 "author": getattr(pr.user, 'login', None) if pr.user else None,
                 "author_type": getattr(pr.user, 'type', None) if pr.user else None,
                 "created_at": getattr(pr, 'created_at', None),
                 "closed_at": getattr(pr, 'closed_at', None) or getattr(pr, 'merged_at', None),
                 "is_merged": getattr(pr, 'merged', False),
-                "mergeable": getattr(pr, 'mergeable', None),
-                "labels": ",".join(label.name for label in pr.labels) if hasattr(pr, 'labels') else "",
+                "labels": ",".join(label.name for label in pr.labels) if hasattr(pr, 'labels') else None,
             }
 
             if pr_data["closed_at"] and pr_data["created_at"]:
