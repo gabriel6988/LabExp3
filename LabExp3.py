@@ -1,211 +1,268 @@
-import os
-import time
-from datetime import datetime, timedelta
 from github import Github, RateLimitExceededException
 import pandas as pd
 from dotenv import load_dotenv
+import os
+import time
+from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Carregar variáveis ​​de ambiente do arquivo .env
 load_dotenv()
 
-# Constantes
-MIN_REVIEW_HOURS = 1  # Duração mínima da revisão a ser considerada (1 hora)
-OUTPUT_FILENAME = "github_pr_reviews.csv" # Nome do arquivo de saída
+MIN_REVIEW_HOURS = 1 # Duração mínima da revisão a ser considerada (1 hora)
+OUTPUT_FILENAME = "github_pr_reviews.csv" # Nome do arquivo onde os dados são salvos
+OUTPUT_DIR = "D:\\" # Local onde os arquivos são salvos
+MAX_REPOSITORIES = 200 # Máximo de Repositórios a serem considerados.
+MIN_PRS = 100 # Mínimo de PRs que os repositórios precisam ter.
+MAX_WORKERS = 3
+API_DELAY = 15
+MAX_RETRIES = 2
+RATE_LIMIT_WAIT = 3600
 
-def initialize_github_client():
-    """Inicializar e retornar o cliente GitHub autenticado."""
-    GITHUB_TOKEN = "" # Colocar a sua Token aqui
-    return Github(GITHUB_TOKEN, per_page=100)  # per_page = 100, reduz chamadas de API
+class GitHubPRCollector:
+    def __init__(self):
+        self.client = self.initialize_github_client()
+        self.rate_limit_remaining = 5000
+        self.last_request_time = datetime.now(timezone.utc)
+        self.hard_rate_limit_hit = False
 
-def handle_rate_limit(github_client):
-    """Lida com os limites de taxa da API do GitHub ao aguardar até que o limite seja redefinido."""
-    rate_limit = github_client.get_rate_limit()
-    reset_time = rate_limit.core.reset
-    wait_seconds = (reset_time - datetime.utcnow()).total_seconds() + 10  # Buffer
-    print(f"Limite de taxa excedido. Aguardando {wait_seconds/60:.1f} minutos...")
-    time.sleep(max(wait_seconds, 0))
-    return True
+    def initialize_github_client(self):
+        """Inicialize o cliente GitHub com autenticação adequada."""
+        GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or "" # Token do Github
+        if not GITHUB_TOKEN:
+            raise ValueError("Token do GitHub não encontrado.")
+        return Github(
+            GITHUB_TOKEN,
+            per_page=100,
+            timeout=30,
+            retry=3,
+            pool_size=MAX_WORKERS
+        )
 
-def get_top_repositories(github_client, limit=200, min_prs=100):
-    """
-    Identifique repositórios populares do GitHub com muitos PRs.
-    
-    Args:
-        github_client: Cliente GitHub autenticado
-        limit: Número máximo de top repositórios a serem considerados
-        min_prs: Número mínimo de PRs que um repositório deve ter para ser incluído
-    
-    Returns:
-        Lista de objetos do repositório que atendem aos critérios
-    """
-    try:
-        print(f"Pesquisando os top {limit} repositórios com pelo menos {min_prs} PRs...")
+    def check_rate_limit(self):
+        """Verifique e manipule limites de taxa com tratamento adequado de fuso horário."""
+        now = datetime.now(timezone.utc)
+        time_since_last = (now - self.last_request_time).total_seconds()
         
-        # Pesquisar repositórios populares classificados por estrelas
-        query = "stars:>1 sort:stars-desc"
-        repos = github_client.search_repositories(query)[:limit]
+        if time_since_last < API_DELAY:
+            time.sleep(API_DELAY - time_since_last)
         
-        filtered_repos = []
-        seen_repos = set()  # Rastreie repositórios vistos para evitar duplicatas
+        try:
+            rate_limit = self.client.get_rate_limit()
+            self.rate_limit_remaining = rate_limit.core.remaining
+            self.last_request_time = datetime.now(timezone.utc)
+            
+            if self.rate_limit_remaining < 100:
+                reset_time = rate_limit.core.reset.replace(tzinfo=timezone.utc)
+                wait_time = (reset_time - now).total_seconds() + 10
+                print(f"Aproximando-se do limite de taxa. Aguardando {wait_time/60:.1f} minutos...")
+                time.sleep(wait_time)
+                return True
+        except Exception as e:
+            print(f"Não foi possível verificar o limite de taxa: {str(e)}.")
         
-        for repo in repos:
+        return False
+
+    def handle_rate_limit_exceeded(self):
+        """Lidar com quando realmente atingimos o limite de taxa."""
+        print(f"Limite de taxa atingido. Parando por {RATE_LIMIT_WAIT/3600:.1f} horas.")
+        time.sleep(RATE_LIMIT_WAIT)
+        self.hard_rate_limit_hit = True
+        self.last_request_time = datetime.now(timezone.utc)
+        return True
+
+    def get_top_repositories(self):
+        """Obtenha repositórios com tratamento de erros robusto."""
+        repos = []
+        attempts = 0
+        
+        while len(repos) < MAX_REPOSITORIES and attempts < MAX_RETRIES:
             try:
-                if repo.full_name in seen_repos:
+                if self.check_rate_limit():
                     continue
-                
-                # Verifique a contagem de RP
-                prs = repo.get_pulls(state='all', sort='created', direction='desc')
-                if prs.totalCount >= min_prs:
-                    filtered_repos.append(repo)
-                    seen_repos.add(repo.full_name)
-                    print(f"Selected: {repo.full_name} (PRs: {prs.totalCount})")
                     
-                    # Saída antecipada se tivermos repositórios suficientes
-                    if len(filtered_repos) >= limit:
+                search = self.client.search_repositories(
+                    "stars:>1",
+                    sort="stars",
+                    order="desc"
+                )
+                
+                for repo in search:
+                    if len(repos) >= MAX_REPOSITORIES:
                         break
                         
+                    try:
+                        if self.check_rate_limit() or self.hard_rate_limit_hit:
+                            return repos
+                            
+                        pr_count = repo.get_pulls(state='all').totalCount
+                        if pr_count >= MIN_PRS:
+                            repos.append(repo)
+                            print(f"Selecionado {len(repos)}/{MAX_REPOSITORIES}: {repo.full_name} (PRs: {pr_count}).")
+                    except RateLimitExceededException:
+                        self.handle_rate_limit_exceeded()
+                        continue
+                    except Exception as e:
+                        print(f"Pulando {repo.full_name}: {str(e)}.")
+                        continue
+                        
+                break
+                
             except RateLimitExceededException:
-                handle_rate_limit(github_client)
-                continue
+                self.handle_rate_limit_exceeded()
+                attempts += 1
             except Exception as e:
-                print(f"Error checking {repo.full_name}: {str(e)}")
-                continue
-        
-        return filtered_repos
-        
-    except RateLimitExceededException:
-        handle_rate_limit(github_client)
-        return get_top_repositories(github_client, limit, min_prs)
-
-def is_human_reviewed_pr(pr, min_hours=MIN_REVIEW_HOURS):
-    """
-    Determinar se um PR foi revisado por humanos com base na duração da revisão.
-    
-    Args:
-        pr: PullRequest object
-        min_hours: Duração mínima da revisão para ser considerada uma revisão humana
-    
-    Returns:
-        bool: Verdadeiro se o PR atender aos critérios de revisão humana
-    """
-    if pr.state.lower() not in ['closed', 'merged']:
-        return False
-    
-    # Deve ter pelo menos uma revisão
-    if pr.get_reviews().totalCount < 1:
-        return False
-    
-    created_at = pr.created_at
-    closed_at = pr.closed_at or pr.merged_at
-    
-    # Deve ter uma data de closed/merged
-    if not closed_at:
-        return False
-    
-    # A revisão deve ter levado pelo menos uma hora
-    review_duration = closed_at - created_at
-    return review_duration > timedelta(hours=min_hours)
-
-def fetch_pr_data(github_client, repo):
-    """
-    Colete dados de RP de um repositório que atenda aos critérios de revisão humana.
-    
-    Args:
-        github_client: Cliente GitHub autenticado
-        repo: Objeto de repositório para analisar
-    
-    Returns:
-        Lista contendo dados de PRs
-    """
-    pr_data = []
-    print(f"\nColetando PRs de {repo.full_name}...")
-    
-    try:
-        # Obtenha todos os PRs (merged ou closed) classificados por data de criação
-        prs = repo.get_pulls(state='all', sort='created', direction='desc')
-        
-        for pr in prs:
-            try:
-                # Pular se não for revisado por humanos
-                if not is_human_reviewed_pr(pr):
-                    continue
+                print(f"Erro de pesquisa: {str(e)}.")
+                attempts += 1
+                time.sleep(60)
                 
-                # Métricas Coletadas
-                pr_info = {
-                    "repo": repo.full_name,
-                    "pr_number": pr.number,
-                    "state": pr.state.lower(),
-                    "title": pr.title[:200],
-                    "author": pr.user.login if pr.user else None,
-                    "author_type": pr.user.type if pr.user else None,
-                    "created_at": pr.created_at,
-                    "closed_at": pr.closed_at or pr.merged_at,
-                    "review_hours": (pr.closed_at - pr.created_at).total_seconds() / 3600,
-                    "comments": pr.comments,
-                    "review_comments": pr.review_comments,
-                    "additions": pr.additions,
-                    "deletions": pr.deletions,
-                    "changed_files": pr.changed_files,
-                    "review_count": pr.get_reviews().totalCount,
-                    "is_merged": pr.is_merged()
-                }
-                
-                pr_data.append(pr_info)
-                
-                # Indicador de progresso
-                if len(pr_data) % 20 == 0:
-                    print(f"{len(pr_data)} PRs coletadas...")
-                    
-            except RateLimitExceededException:
-                handle_rate_limit(github_client)
-                continue
-            except Exception as e:
-                print(f"Erro ao processar PR #{pr.number}: {str(e)}")
-                continue
-                
-    except RateLimitExceededException:
-        handle_rate_limit(github_client)
-        return fetch_pr_data(github_client, repo)
-    except Exception as e:
-        print(f"Erro ao buscar PRs para {repo.full_name}: {str(e)}")
-    
-    print(f"Concluída a coleta de {len(pr_data)} PRs de {repo.full_name}")
-    return pr_data
+        return repos[:MAX_REPOSITORIES]
 
-def save_to_csv(data, filename):
-    """Salvar os dados coletados em CSV."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    filepath = os.path.join(script_dir, filename)
-    
-    df = pd.DataFrame(data)
-    df.to_csv(filepath, index=False)
-    print(f"Data saved to {filepath}")
+    def is_human_reviewed_pr(self, pr):
+        """Verifique o status da revisão do PR com tratamento de erros."""
+        try:
+            if pr.state.lower() not in ['closed', 'merged']:
+                return False
+                
+            self.check_rate_limit()
+            if pr.get_reviews().totalCount < 1:
+                return False
+                
+            created_at = pr.created_at
+            closed_at = pr.closed_at or pr.merged_at
+            if not closed_at:
+                return False
+                
+            return (closed_at - created_at) > timedelta(hours=MIN_REVIEW_HOURS)
+        except Exception:
+            return False
 
-def main():
-    try:
-        # Inicializar cliente GitHub
-        g = initialize_github_client()
-        
-        # Etapa 1: Obtenha os top repositórios
-        repositories = get_top_repositories(g, limit=200, min_prs=100)
-        
-        # Etapa 2: Coletar dados PR de cada repositório
-        all_pr_data = []
-        for repo in repositories:
-            pr_data = fetch_pr_data(g, repo)
-            all_pr_data.extend(pr_data)
+    def safe_get_pr_data(self, pr, repo_name, attempt=1):
+        """Obtenha dados do PR com segurança e com lógica de repetição."""
+        try:
+            if not self.is_human_reviewed_pr(pr):
+                return None
+
+            pr_data = {
+                "repo": repo_name,
+                "pr_number": pr.number,
+                "state": pr.state.lower(),
+                "title": getattr(pr, 'title', '')[:200],
+                "title_length": len(getattr(pr, 'title', '')),
+                "description_length": len(pr.body) if pr.body else 0,
+                "description_markdown_chars": len(pr.body) if pr.body else 0,
+                "description_code_blocks": pr.body.count('```')//2 if pr.body else 0,
+                "author": getattr(pr.user, 'login', None) if pr.user else None,
+                "author_type": getattr(pr.user, 'type', None) if pr.user else None,
+                "created_at": getattr(pr, 'created_at', None),
+                "closed_at": getattr(pr, 'closed_at', None) or getattr(pr, 'merged_at', None),
+                "is_merged": getattr(pr, 'merged', False),
+                "mergeable": getattr(pr, 'mergeable', None),
+                "labels": ",".join(label.name for label in pr.labels) if hasattr(pr, 'labels') else "",
+            }
+
+            if pr_data["closed_at"] and pr_data["created_at"]:
+                pr_data["review_hours"] = (pr_data["closed_at"] - pr_data["created_at"]).total_seconds() / 3600
+            else:
+                pr_data["review_hours"] = None
+
+            self.check_rate_limit()
+            comments = list(pr.get_comments()) if attempt == 1 else []
             
-            # Salvar o progresso após cada repositório
-            save_to_csv(all_pr_data, OUTPUT_FILENAME)
+            self.check_rate_limit()
+            reviews = list(pr.get_reviews()) if attempt == 1 else []
+
+            pr_data.update({
+                "comments": len(comments),
+                "review_comments": len(reviews),
+                "unique_participants": len(set(
+                    [c.user.login for c in comments if c and hasattr(c, 'user') and c.user] +
+                    [r.user.login for r in reviews if r and hasattr(r, 'user') and r.user]
+                )),
+                "additions": getattr(pr, 'additions', 0),
+                "deletions": getattr(pr, 'deletions', 0),
+                "changed_files": getattr(pr, 'changed_files', 0),
+                "changes_size": getattr(pr, 'additions', 0) + getattr(pr, 'deletions', 0),
+                "review_count": len(reviews),
+                "approval_count": sum(1 for r in reviews if r and getattr(r, 'state', None) == 'APPROVED'),
+                "request_changes_count": sum(1 for r in reviews if r and getattr(r, 'state', None) == 'CHANGES_REQUESTED')
+            })
+
+            return pr_data
+
+        except RateLimitExceededException:
+            if attempt <= MAX_RETRIES:
+                self.handle_rate_limit_exceeded()
+                return self.safe_get_pr_data(pr, repo_name, attempt + 1)
+            print(f"Máximo de tentativas alcançadas para PR: {pr.number}.")
+            return None
+        except Exception as e:
+            print(f"Erro ao processar PR #{pr.number}: {str(e)}.")
+            return None
+
+    def fetch_repository_prs(self, repo):
+        """Buscar PRs para um único repositório."""
+        print(f"\nColetando PRs de {repo.full_name}...")
+        pr_data = []
+        try:
+            self.check_rate_limit()
+            prs = list(repo.get_pulls(state='all', sort='created', direction='desc'))
             
-            time.sleep(10)
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {executor.submit(self.safe_get_pr_data, pr, repo.full_name): pr for pr in prs}
+                
+                for i, future in enumerate(as_completed(futures), 1):
+                    try:
+                        result = future.result()
+                        if result:
+                            pr_data.append(result)
+                            if i % 20 == 0: # Indicador de progresso
+                                print(f"Processado {i}/{len(prs)} PRs ({len(pr_data)} valídas).")
+                    except Exception as e:
+                        print(f"Erro ao processar: {str(e)}.")
+                        
+        except RateLimitExceededException:
+            self.handle_rate_limit_exceeded()
+            return self.fetch_repository_prs(repo)
+        except Exception as e:
+            print(f"Erro ao buscar PRs de {repo.full_name}: {str(e)}.")
         
-        # Salvamento final
-        save_to_csv(all_pr_data, OUTPUT_FILENAME)
-        print(f"\nAnálise completa. {len(all_pr_data)} PRs coletadas.")
-        
-    except Exception as e:
-        print(f"O script falhou: {str(e)}")
+        print(f"Concluído {repo.full_name} com {len(pr_data)} PRs válidas.")
+        return pr_data
+
+    def save_to_csv(self, data):
+        """Salvar dados com formatação adequada."""
+        filepath = os.path.join(OUTPUT_DIR, OUTPUT_FILENAME)
+        try:
+            df = pd.DataFrame(data)
+            for col in ['created_at', 'closed_at']:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col]).dt.strftime('%Y-%m-%d %H:%M:%S')
+            df.to_csv(filepath, index=False)
+            print(f"Dados salvos em {filepath}.")
+        except Exception as e:
+            print(f"Erro ao salvar CSV: {str(e)}.")
+
+    def run(self):
+        """Método de execução principal."""
+        try:
+            repos = self.get_top_repositories()
+            print(f"\n Foram encontrados {len(repos)} repositórios para processar.")
+            
+            all_pr_data = []
+            for i, repo in enumerate(repos, 1):
+                print(f"\nProcessando Repositório {i}/{len(repos)}: {repo.full_name}.")
+                repo_data = self.fetch_repository_prs(repo)
+                all_pr_data.extend(repo_data)
+                self.save_to_csv(all_pr_data)
+                time.sleep(API_DELAY)
+            
+            self.save_to_csv(all_pr_data)
+            print(f"\nAnálise completa. Coletada {len(all_pr_data)} PRs de {len(repos)} repositórios.")
+            
+        except Exception as e:
+            print(f"O script falhou: {str(e)}.")
+            raise
 
 if __name__ == "__main__":
-    main()
+    collector = GitHubPRCollector()
+    collector.run()
