@@ -146,20 +146,19 @@ class GitHubPRCollector:
                 "repo": repo_name,
                 "pr_number": pr.number,
                 "state": pr.state.lower(),
-                "title": getattr(pr, 'title', '')[:200],
                 "title_length": len(getattr(pr, 'title', '')),
-                "description_length": len(pr.body) if pr.body else 0,
+                "description_length": len(pr.body) if pr.body else 0, # RQ03, RQ07
                 "description_code_blocks": pr.body.count('```')//2 if pr.body else 0,
                 "author": getattr(pr.user, 'login', None) if pr.user else None,
                 "author_type": getattr(pr.user, 'type', None) if pr.user else None,
                 "created_at": getattr(pr, 'created_at', None),
                 "closed_at": getattr(pr, 'closed_at', None) or getattr(pr, 'merged_at', None),
-                "is_merged": getattr(pr, 'merged', False),
+                "is_merged": getattr(pr, 'merged', False), # RQ01, RQ02, RQ03, RQ04
                 "labels": ",".join(label.name for label in pr.labels) if hasattr(pr, 'labels') else None,
             }
 
             if pr_data["closed_at"] and pr_data["created_at"]:
-                pr_data["review_hours"] = (pr_data["closed_at"] - pr_data["created_at"]).total_seconds() / 3600
+                pr_data["review_hours"] = (pr_data["closed_at"] - pr_data["created_at"]).total_seconds() / 3600 # RQ02, RQ06
             else:
                 pr_data["review_hours"] = None
 
@@ -170,17 +169,17 @@ class GitHubPRCollector:
             reviews = list(pr.get_reviews()) if attempt == 1 else []
 
             pr_data.update({
-                "comments": len(comments),
-                "review_comments": len(reviews),
+                "comments": len(comments), # RQ04, RQ08
+                "review_comments": len(reviews), # RQ04, RQ08
                 "unique_participants": len(set(
                     [c.user.login for c in comments if c and hasattr(c, 'user') and c.user] +
                     [r.user.login for r in reviews if r and hasattr(r, 'user') and r.user]
-                )),
+                )), # RQ04, RQ08
                 "additions": getattr(pr, 'additions', 0),
                 "deletions": getattr(pr, 'deletions', 0),
-                "changed_files": getattr(pr, 'changed_files', 0),
-                "changes_size": getattr(pr, 'additions', 0) + getattr(pr, 'deletions', 0),
-                "review_count": len(reviews),
+                "changed_files": getattr(pr, 'changed_files', 0), # RQ01, RQ05
+                "changes_size": getattr(pr, 'additions', 0) + getattr(pr, 'deletions', 0), # RQ01, RQ05
+                "review_count": len(reviews), # RQ05, RQ06, RQ07, RQ08
                 "approval_count": sum(1 for r in reviews if r and getattr(r, 'state', None) == 'APPROVED'),
                 "request_changes_count": sum(1 for r in reviews if r and getattr(r, 'state', None) == 'CHANGES_REQUESTED')
             })
