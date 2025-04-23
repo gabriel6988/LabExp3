@@ -8,175 +8,196 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv()
 
-MIN_REVIEW_HOURS = 1 # Duração mínima da revisão a ser considerada (1 hora)
-OUTPUT_FILENAME = "github_pr_reviews.csv" # Nome do arquivo onde os dados são salvos
-OUTPUT_DIR = "D:\\" # Local onde os arquivos são salvos
-MAX_REPOSITORIES = 200 # Máximo de Repositórios a serem considerados.
-MIN_PRS = 100 # Mínimo de PRs que os repositórios precisam ter.
-MAX_WORKERS = 3
-API_DELAY = 15
-MAX_RETRIES = 2
-RATE_LIMIT_WAIT = 3600
+# Configurações
+HORAS_MINIMAS_REVISAO = 1
+ARQUIVO_SAIDA_ANTIGO = "github_pr_reviews_antigo.csv"
+ARQUIVO_SAIDA_NOVO = "github_pr_reviews_novo.csv"
+DIRETORIO_SAIDA = "D:\\"
+MAX_REPOSITORIOS = 200
+MIN_PRS = 100
+MAX_THREADS = 3
+DELAY_REQUISICAO = 15
+MAX_TENTATIVAS = 2
+ESPERA_LIMITE_TAXA = 3600
 
-class GitHubPRCollector:
+class ColetorPRsGitHub:
     def __init__(self):
-        self.client = self.initialize_github_client()
-        self.rate_limit_remaining = 5000
-        self.last_request_time = datetime.now(timezone.utc)
-        self.hard_rate_limit_hit = False
+        self.cliente = self.inicializar_cliente_github()
+        self.limite_requisicoes_restante = 5000
+        self.ultimo_tempo_requisicao = datetime.now(timezone.utc)
+        self.limite_taxa_atingido = False
+        self.repositorios_processados = set()
+        self.carregar_repositorios_processados()
 
-    def initialize_github_client(self):
-        """Inicialize o cliente GitHub com autenticação adequada."""
-        GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or "" # Token do Github
-        if not GITHUB_TOKEN:
-            raise ValueError("Token do GitHub não encontrado.")
+    def inicializar_cliente_github(self):
+        """Inicializa o cliente GitHub com autenticação"""
+        TOKEN_GITHUB = os.getenv("GITHUB_TOKEN") or ""
+        if not TOKEN_GITHUB:
+            raise ValueError("Token do GitHub não encontrado no arquivo .env")
         return Github(
-            GITHUB_TOKEN,
+            TOKEN_GITHUB,
             per_page=100,
             timeout=30,
             retry=3,
-            pool_size=MAX_WORKERS
+            pool_size=MAX_THREADS
         )
 
-    def check_rate_limit(self):
-        """Verifique e manipule limites de taxa com tratamento adequado de fuso horário."""
-        now = datetime.now(timezone.utc)
-        time_since_last = (now - self.last_request_time).total_seconds()
+    def carregar_repositorios_processados(self):
+        """Carrega apenas os nomes dos repositórios já processados"""
+        caminho_antigo = os.path.join(DIRETORIO_SAIDA, ARQUIVO_SAIDA_ANTIGO)
+        if os.path.exists(caminho_antigo):
+            try:
+                df_antigo = pd.read_csv(caminho_antigo)
+                self.repositorios_processados = set(df_antigo['repo'].unique())
+                print(f"Encontrados {len(self.repositorios_processados)} repositórios já processados")
+            except Exception as e:
+                print(f"Erro ao carregar dados antigos: {str(e)}")
+
+    def verificar_limite_taxa(self):
+        """Verifica e gerencia os limites de taxa da API"""
+        agora = datetime.now(timezone.utc)
+        tempo_desde_ultima = (agora - self.ultimo_tempo_requisicao).total_seconds()
         
-        if time_since_last < API_DELAY:
-            time.sleep(API_DELAY - time_since_last)
+        if tempo_desde_ultima < DELAY_REQUISICAO:
+            time.sleep(DELAY_REQUISICAO - tempo_desde_ultima)
         
         try:
-            rate_limit = self.client.get_rate_limit()
-            self.rate_limit_remaining = rate_limit.core.remaining
-            self.last_request_time = datetime.now(timezone.utc)
+            limite_taxa = self.cliente.get_rate_limit()
+            self.limite_requisicoes_restante = limite_taxa.core.remaining
+            self.ultimo_tempo_requisicao = datetime.now(timezone.utc)
             
-            if self.rate_limit_remaining < 100:
-                reset_time = rate_limit.core.reset.replace(tzinfo=timezone.utc)
-                wait_time = (reset_time - now).total_seconds() + 10
-                print(f"Aproximando-se do limite de taxa. Aguardando {wait_time/60:.1f} minutos...")
-                time.sleep(wait_time)
+            if self.limite_requisicoes_restante < 100:
+                tempo_reset = limite_taxa.core.reset.replace(tzinfo=timezone.utc)
+                tempo_espera = (tempo_reset - agora).total_seconds() + 10
+                print(f"Limite de taxa próximo. Aguardando {tempo_espera/60:.1f} minutos...")
+                time.sleep(tempo_espera)
                 return True
         except Exception as e:
-            print(f"Não foi possível verificar o limite de taxa: {str(e)}.")
+            print(f"Não foi possível verificar o limite de taxa: {str(e)}")
         
         return False
 
-    def handle_rate_limit_exceeded(self):
-        """Lidar com quando realmente atingimos o limite de taxa."""
-        print(f"Limite de taxa atingido. Parando por {RATE_LIMIT_WAIT/3600:.1f} horas.")
-        time.sleep(RATE_LIMIT_WAIT)
-        self.hard_rate_limit_hit = True
-        self.last_request_time = datetime.now(timezone.utc)
+    def tratar_limite_taxa_atingido(self):
+        """Ação quando o limite de taxa é atingido"""
+        print(f"Limite de taxa atingido. Aguardando {ESPERA_LIMITE_TAXA/3600:.1f} horas.")
+        time.sleep(ESPERA_LIMITE_TAXA)
+        self.limite_taxa_atingido = True
+        self.ultimo_tempo_requisicao = datetime.now(timezone.utc)
         return True
 
-    def get_top_repositories(self):
-        """Obtenha repositórios com tratamento de erros robusto."""
-        repos = []
-        attempts = 0
-        
-        while len(repos) < MAX_REPOSITORIES and attempts < MAX_RETRIES:
+    def obter_repositorios_top(self):
+        """Obtém os repositórios mais populares, completando até 200 no total"""
+        repositorios = []
+        tentativas = 0
+        repos_needed = MAX_REPOSITORIOS - len(self.repositorios_processados)
+
+        while len(repositorios) < repos_needed and tentativas < MAX_TENTATIVAS:
             try:
-                if self.check_rate_limit():
+                if self.verificar_limite_taxa():
                     continue
-                    
-                search = self.client.search_repositories(
+                
+                busca = self.cliente.search_repositories(
                     "stars:>1",
                     sort="stars",
                     order="desc"
                 )
-                
-                for repo in search:
-                    if len(repos) >= MAX_REPOSITORIES:
-                        break
-                        
-                    try:
-                        if self.check_rate_limit() or self.hard_rate_limit_hit:
-                            return repos
-                            
-                        pr_count = repo.get_pulls(state='all').totalCount
-                        if pr_count >= MIN_PRS:
-                            repos.append(repo)
-                            print(f"Selecionado {len(repos)}/{MAX_REPOSITORIES}: {repo.full_name} (PRs: {pr_count}).")
-                    except RateLimitExceededException:
-                        self.handle_rate_limit_exceeded()
-                        continue
-                    except Exception as e:
-                        print(f"Pulando {repo.full_name}: {str(e)}.")
-                        continue
-                        
-                break
-                
-            except RateLimitExceededException:
-                self.handle_rate_limit_exceeded()
-                attempts += 1
-            except Exception as e:
-                print(f"Erro de pesquisa: {str(e)}.")
-                attempts += 1
-                time.sleep(60)
-                
-        return repos[:MAX_REPOSITORIES]
 
-    def is_human_reviewed_pr(self, pr):
-        """Verifique o status da revisão do PR com tratamento de erros."""
+                for repo in busca:
+                    if len(repositorios) >= repos_needed:
+                        break
+                    
+                    if repo.full_name in self.repositorios_processados:
+                        continue
+                    
+                    try:
+                        if self.verificar_limite_taxa() or self.limite_taxa_atingido:
+                            return repositorios
+                        
+                        contagem_prs = repo.get_pulls(state='all').totalCount
+
+                        if contagem_prs >= MIN_PRS:
+                            repositorios.append(repo)
+                            print(f"Selecionado {len(repositorios)}/{repos_needed}: {repo.full_name} (PRs: {contagem_prs})")
+
+                    except RateLimitExceededException:
+                        self.tratar_limite_taxa_atingido()
+                        continue
+
+                    except Exception as e:
+                        print(f"Pulando {repo.full_name}: {str(e)}")
+                        continue
+                break
+            
+            except RateLimitExceededException:
+                self.tratar_limite_taxa_atingido()
+                tentativas += 1
+            except Exception as e:
+                print(f"Erro na busca: {str(e)}")
+                tentativas += 1
+                time.sleep(60)
+    
+        return repositorios
+
+    def eh_pr_revisado_por_humano(self, pr):
+        """Verifica se o PR foi revisado por humanos"""
         try:
             if pr.state.lower() not in ['closed', 'merged']:
                 return False
                 
-            self.check_rate_limit()
+            self.verificar_limite_taxa()
             if pr.get_reviews().totalCount < 1:
                 return False
                 
-            created_at = pr.created_at
-            closed_at = pr.closed_at or pr.merged_at
-            if not closed_at:
+            data_criacao = pr.created_at
+            data_fechamento = pr.closed_at or pr.merged_at
+            if not data_fechamento:
                 return False
                 
-            return (closed_at - created_at) > timedelta(hours=MIN_REVIEW_HOURS)
+            return (data_fechamento - data_criacao) > timedelta(hours=HORAS_MINIMAS_REVISAO)
         except Exception:
             return False
 
-    def safe_get_pr_data(self, pr, repo_name, attempt=1):
-        """Obtenha dados do PR com segurança e com lógica de repetição."""
+    def obter_dados_pr_seguro(self, pr, nome_repo, tentativa=1):
+        """Obtém dados do PR com tratamento de erros e repetição"""
         try:
-            if not self.is_human_reviewed_pr(pr):
+            if not self.eh_pr_revisado_por_humano(pr):
                 return None
 
             pr_data = {
-                "repo": repo_name,
+                "repo": nome_repo,
                 "pr_number": pr.number,
                 "state": pr.state.lower(),
                 "title_length": len(getattr(pr, 'title', '')),
-                "description_length": len(pr.body) if pr.body else 0, # RQ03, RQ07
+                "description_length": len(pr.body) if pr.body else 0,
                 "description_code_blocks": pr.body.count('```')//2 if pr.body else 0,
                 "created_at": getattr(pr, 'created_at', None),
                 "closed_at": getattr(pr, 'closed_at', None) or getattr(pr, 'merged_at', None),
-                "is_merged": getattr(pr, 'merged', False), # RQ01, RQ02, RQ03, RQ04
+                "is_merged": getattr(pr, 'merged', False),
             }
 
             if pr_data["closed_at"] and pr_data["created_at"]:
-                pr_data["review_hours"] = (pr_data["closed_at"] - pr_data["created_at"]).total_seconds() / 3600 # RQ02, RQ06
+                pr_data["review_hours"] = (pr_data["closed_at"] - pr_data["created_at"]).total_seconds() / 3600
             else:
                 pr_data["review_hours"] = None
 
-            self.check_rate_limit()
-            comments = list(pr.get_comments()) if attempt == 1 else []
+            self.verificar_limite_taxa()
+            comments = list(pr.get_comments()) if tentativa == 1 else []
             
-            self.check_rate_limit()
-            reviews = list(pr.get_reviews()) if attempt == 1 else []
+            self.verificar_limite_taxa()
+            reviews = list(pr.get_reviews()) if tentativa == 1 else []
 
             pr_data.update({
-                "comments": len(comments), # RQ04, RQ08
-                "review_comments": len(reviews), # RQ04, RQ08
+                "comments": len(comments),
+                "review_comments": len(reviews),
                 "unique_participants": len(set(
                     [c.user.login for c in comments if c and hasattr(c, 'user') and c.user] +
                     [r.user.login for r in reviews if r and hasattr(r, 'user') and r.user]
-                )), # RQ04, RQ08
+                )),
                 "additions": getattr(pr, 'additions', 0),
                 "deletions": getattr(pr, 'deletions', 0),
-                "changed_files": getattr(pr, 'changed_files', 0), # RQ01, RQ05
-                "changes_size": getattr(pr, 'additions', 0) + getattr(pr, 'deletions', 0), # RQ01, RQ05
-                "review_count": len(reviews), # RQ05, RQ06, RQ07, RQ08
+                "changed_files": getattr(pr, 'changed_files', 0),
+                "changes_size": getattr(pr, 'additions', 0) + getattr(pr, 'deletions', 0),
+                "review_count": len(reviews),
                 "approval_count": sum(1 for r in reviews if r and getattr(r, 'state', None) == 'APPROVED'),
                 "request_changes_count": sum(1 for r in reviews if r and getattr(r, 'state', None) == 'CHANGES_REQUESTED')
             })
@@ -184,79 +205,87 @@ class GitHubPRCollector:
             return pr_data
 
         except RateLimitExceededException:
-            if attempt <= MAX_RETRIES:
-                self.handle_rate_limit_exceeded()
-                return self.safe_get_pr_data(pr, repo_name, attempt + 1)
-            print(f"Máximo de tentativas alcançadas para PR: {pr.number}.")
+            if tentativa <= MAX_TENTATIVAS:
+                self.tratar_limite_taxa_atingido()
+                return self.obter_dados_pr_seguro(pr, nome_repo, tentativa + 1)
+            print(f"Máximo de tentativas alcançado para PR: {pr.number}")
             return None
         except Exception as e:
-            print(f"Erro ao processar PR #{pr.number}: {str(e)}.")
+            print(f"Erro ao processar PR #{pr.number}: {str(e)}")
             return None
 
-    def fetch_repository_prs(self, repo):
-        """Buscar PRs para um único repositório."""
+    def coletar_prs_repositorio(self, repo):
+        """Coleta PRs de um único repositório"""
         print(f"\nColetando PRs de {repo.full_name}...")
-        pr_data = []
+        dados_pr = []
         try:
-            self.check_rate_limit()
+            self.verificar_limite_taxa()
             prs = list(repo.get_pulls(state='all', sort='created', direction='desc'))
             
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = {executor.submit(self.safe_get_pr_data, pr, repo.full_name): pr for pr in prs}
+            with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+                futuros = {executor.submit(self.obter_dados_pr_seguro, pr, repo.full_name): pr for pr in prs}
                 
-                for i, future in enumerate(as_completed(futures), 1):
+                for i, futuro in enumerate(as_completed(futuros), 1):
                     try:
-                        result = future.result()
-                        if result:
-                            pr_data.append(result)
-                            if i % 20 == 0: # Indicador de progresso
-                                print(f"Processado {i}/{len(prs)} PRs ({len(pr_data)} valídas).")
+                        resultado = futuro.result()
+                        if resultado:
+                            dados_pr.append(resultado)
+                            if i % 20 == 0:
+                                print(f"Processados {i}/{len(prs)} PRs ({len(dados_pr)} válidos)")
                     except Exception as e:
-                        print(f"Erro ao processar: {str(e)}.")
+                        print(f"Erro ao processar: {str(e)}")
                         
         except RateLimitExceededException:
-            self.handle_rate_limit_exceeded()
-            return self.fetch_repository_prs(repo)
+            self.tratar_limite_taxa_atingido()
+            return self.coletar_prs_repositorio(repo)
         except Exception as e:
-            print(f"Erro ao buscar PRs de {repo.full_name}: {str(e)}.")
+            print(f"Erro ao buscar PRs de {repo.full_name}: {str(e)}")
         
-        print(f"Concluído {repo.full_name} com {len(pr_data)} PRs válidas.")
-        return pr_data
+        print(f"Concluído {repo.full_name} com {len(dados_pr)} PRs válidos")
+        return dados_pr
 
-    def save_to_csv(self, data):
-        """Salvar dados com formatação adequada."""
-        filepath = os.path.join(OUTPUT_DIR, OUTPUT_FILENAME)
+    def salvar_para_csv(self, novos_dados):
+        """Salva em novo arquivo, mantendo o histórico intacto"""
+        caminho_novo = os.path.join(DIRETORIO_SAIDA, ARQUIVO_SAIDA_NOVO)
         try:
-            df = pd.DataFrame(data)
+            df_novo = pd.DataFrame(novos_dados)
+            
             for col in ['created_at', 'closed_at']:
-                if col in df.columns:
-                    df[col] = pd.to_datetime(df[col]).dt.strftime('%Y-%m-%d %H:%M:%S')
-            df.to_csv(filepath, index=False)
-            print(f"Dados salvos em {filepath}.")
+                if col in df_novo.columns:
+                    df_novo[col] = pd.to_datetime(df_novo[col]).dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            if os.path.exists(caminho_novo):
+                df_existente = pd.read_csv(caminho_novo)
+                df_completo = pd.concat([df_existente, df_novo]).drop_duplicates(subset=['repo', 'pr_number'])
+            else:
+                df_completo = df_novo
+                
+            df_completo.to_csv(caminho_novo, index=False)
+            print(f"Dados salvos em {caminho_novo} (Total: {len(df_completo)} registros)")
+            
         except Exception as e:
-            print(f"Erro ao salvar CSV: {str(e)}.")
+            print(f"Erro ao salvar CSV: {str(e)}")
 
-    def run(self):
-        """Método de execução principal."""
+    def executar(self):
+        """Método principal de execução"""
         try:
-            repos = self.get_top_repositories()
-            print(f"\n Foram encontrados {len(repos)} repositórios para processar.")
+            repositorios = self.obter_repositorios_top()
+            print(f"\nEncontrados {len(repositorios)} novos repositórios para processar")
             
-            all_pr_data = []
-            for i, repo in enumerate(repos, 1):
-                print(f"\nProcessando Repositório {i}/{len(repos)}: {repo.full_name}.")
-                repo_data = self.fetch_repository_prs(repo)
-                all_pr_data.extend(repo_data)
-                self.save_to_csv(all_pr_data)
-                time.sleep(API_DELAY)
+            novos_dados_pr = []
+            for i, repo in enumerate(repositorios, 1):
+                print(f"\nProcessando Repositório {i}/{len(repositorios)}: {repo.full_name}")
+                dados_repo = self.coletar_prs_repositorio(repo)
+                novos_dados_pr.extend(dados_repo)
+                self.salvar_para_csv(novos_dados_pr)
+                time.sleep(DELAY_REQUISICAO)
             
-            self.save_to_csv(all_pr_data)
-            print(f"\nAnálise completa. Coletada {len(all_pr_data)} PRs de {len(repos)} repositórios.")
+            print(f"\nAnálise concluída. Coletados {len(novos_dados_pr)} novos PRs")
             
         except Exception as e:
-            print(f"O script falhou: {str(e)}.")
+            print(f"Falha no script: {str(e)}")
             raise
 
 if __name__ == "__main__":
-    collector = GitHubPRCollector()
-    collector.run()
+    coletor = ColetorPRsGitHub()
+    coletor.executar()
